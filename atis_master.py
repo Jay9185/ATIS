@@ -259,4 +259,3 @@ def run_atis_monitor():
 
 if __name__ == "__main__":
     run_atis_monitor()
-```
