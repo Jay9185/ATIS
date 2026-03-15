@@ -219,7 +219,7 @@ def run_atis_monitor():
         """
 
         response  = client.models.generate_content(
-            model='gemini-2.0-flash',
+            model='gemini-2.0-flash-lite',
             contents=[prompt, file_upload]
         )
         full_text = response.text
