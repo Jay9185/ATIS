@@ -108,7 +108,7 @@ def run_atis_monitor():
 
         # FIX 4: Reverted to the stable production model name to prevent 404 errors
         response = client.models.generate_content(
-            model='gemini-2.0-flash', 
+            model='gemini-1.5-flash', 
             contents=[prompt, file_upload]
         )
         full_text = response.text
