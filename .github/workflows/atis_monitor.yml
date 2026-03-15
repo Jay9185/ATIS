@@ -5,10 +5,14 @@ on:
     - cron: '05,35 * * * *' # 5 and 35 minutes past the hour
   workflow_dispatch:
 
-# FIX: Prevents overlapping runs causing double-notifications
+# Prevents overlapping runs causing double-notifications
 concurrency:
   group: atis-monitor
   cancel-in-progress: false
+
+# FIX: Grant the runner permission to push the state file back to the repo
+permissions:
+  contents: write
 
 jobs:
   monitor:
@@ -37,6 +41,12 @@ jobs:
         run: |
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
-          git add last_atis_letter.txt
-          git commit -m "Update ATIS state" || exit 0
-          git push
+          
+          # FIX: Only attempt to track and commit if the Python script successfully created the file
+          if [ -f last_atis_letter.txt ]; then
+            git add last_atis_letter.txt
+            git commit -m "Update ATIS state" || exit 0
+            git push
+          else
+            echo "State file not found. Python script may have crashed or no new ATIS was detected."
+          fi
