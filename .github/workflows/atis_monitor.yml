@@ -1,0 +1,42 @@
+name: Proactive ATIS Monitor
+
+on:
+  schedule:
+    - cron: '05,35 * * * *' # 5 and 35 minutes past the hour
+  workflow_dispatch:
+
+# FIX: Prevents overlapping runs causing double-notifications
+concurrency:
+  group: atis-monitor
+  cancel-in-progress: false
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Tools
+        run: |
+          sudo apt update && sudo apt install ffmpeg -y
+          pip install google-genai requests
+
+      - name: Run Monitor
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python atis_master.py
+
+      - name: Commit State
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add last_atis_letter.txt
+          git commit -m "Update ATIS state" || exit 0
+          git push
