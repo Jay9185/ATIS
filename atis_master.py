@@ -7,17 +7,15 @@ from datetime import datetime
 from google import genai
 
 # --- CONFIGURATION ---
-# Set these directly here OR use environment variables
 API_KEY       = os.getenv("GEMINI_API_KEY",    "YOUR_GEMINI_API_KEY_HERE")
 BOT_TOKEN     = os.getenv("TELEGRAM_BOT_TOKEN","YOUR_TELEGRAM_BOT_TOKEN_HERE")
 CHAT_ID       = os.getenv("TELEGRAM_CHAT_ID",  "YOUR_TELEGRAM_CHAT_ID_HERE")
 
 STREAM_URL    = "http://s1-fmt2.liveatc.net/kdvt3_atis"
-AUDIO_FILE    = "/tmp/atis_temp.mp3"           # Temp file, always deleted after use
-LOGS_DIR      = os.path.expanduser("~/atis_logs")  # Transcript storage
+AUDIO_FILE    = "/tmp/atis_temp.mp3"
+LOGS_DIR      = os.path.expanduser("~/atis_logs")
 STATE_FILE    = os.path.expanduser("~/atis_state/last_atis_letter.txt")
 
-# KDVT runway headings — add more if needed
 RUNWAY_HEADINGS = {
     "7L":  74,  "25R": 254,
     "7R":  74,  "25L": 254,
@@ -30,37 +28,18 @@ RUNWAY_HEADINGS = {
 # ──────────────────────────────────────────────
 
 def parse_wind(full_text):
-    """
-    Extract wind direction and speed from ATIS text.
-    Handles:
-      - "270 at 8" / "270 at 8 gusting 15"
-      - METAR style "27008KT" / "27008G15KT"
-      - "calm"
-    Returns (direction_deg, speed_kt) or (None, 0) for calm, (None, None) if unparseable.
-    """
-    # Plain-English style: "270 at 8"
     m = re.search(r'wind[s]?\s+(\d{3})\s+at\s+(\d+)', full_text, re.IGNORECASE)
     if m:
         return int(m.group(1)), int(m.group(2))
-
-    # METAR style: "27008KT" or "27008G15KT"
     m = re.search(r'\b(\d{3})(\d{2,3})(?:G\d+)?KT\b', full_text, re.IGNORECASE)
     if m:
         return int(m.group(1)), int(m.group(2))
-
-    # Calm winds
     if re.search(r'\bcalm\b', full_text, re.IGNORECASE):
         return None, 0
-
-    return None, None  # Unparseable
+    return None, None
 
 
 def calc_wind_components(wind_dir, wind_speed, runway_heading):
-    """
-    Returns (headwind_kt, crosswind_kt).
-    Positive headwind = into the wind (good).
-    Positive crosswind = from the right, negative = from the left.
-    """
     angle     = math.radians(wind_dir - runway_heading)
     headwind  = round(wind_speed * math.cos(angle), 1)
     crosswind = round(wind_speed * math.sin(angle), 1)
@@ -68,28 +47,22 @@ def calc_wind_components(wind_dir, wind_speed, runway_heading):
 
 
 def wind_components_summary(full_text, runways_in_use):
-    """Build a formatted wind component block for all active runways."""
     wind_dir, wind_speed = parse_wind(full_text)
 
     if wind_speed == 0:
         return "🌬️ *Wind Components:* Calm — no crosswind component."
-
     if wind_dir is None or wind_speed is None:
         return "🌬️ *Wind Components:* Could not parse wind data from ATIS."
 
     lines = [f"🌬️ *Wind Components* (winds {wind_dir:03d}° at {wind_speed}kt):"]
-
     for rwy in runways_in_use:
         heading = RUNWAY_HEADINGS.get(rwy.upper())
         if heading is None:
             lines.append(f"  • Runway {rwy}: heading unknown — skipped.")
             continue
-
         hw, xw = calc_wind_components(wind_dir, wind_speed, heading)
-
         hw_label = f"{abs(hw)}kt {'headwind ✅' if hw >= 0 else 'tailwind ⚠️'}"
         xw_label = f"{abs(xw)}kt from the {'right' if xw >= 0 else 'left'}"
-
         lines.append(f"  • Rwy {rwy} ({heading:03d}°): {hw_label} | {xw_label}")
 
     return "\n".join(lines)
@@ -100,10 +73,6 @@ def wind_components_summary(full_text, runways_in_use):
 # ──────────────────────────────────────────────
 
 def parse_runways_from_text(full_text):
-    """
-    Fallback: scan full ATIS text for runway mentions.
-    Matches patterns like: 'Runway 7L', 'Runways 7L and 25R'
-    """
     matches = re.findall(
         r'\bRunway[s]?\s+([\d]{1,2}[LRC]?(?:\s+and\s+[\d]{1,2}[LRC]?)*)',
         full_text, re.IGNORECASE
@@ -123,8 +92,8 @@ def parse_runways_from_text(full_text):
 # ──────────────────────────────────────────────
 
 def send_telegram(message):
-    url     = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": CHAT_ID, "text": message, "parse_mode": "Markdown"}
+    url      = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    payload  = {"chat_id": CHAT_ID, "text": message, "parse_mode": "Markdown"}
     response = requests.post(url, json=payload, timeout=10)
     response.raise_for_status()
 
@@ -161,7 +130,7 @@ def save_transcript(timestamp, letter, full_text, runways, wind_summary):
         f.write(f"{'-' * 40}\n")
         f.write(full_text)
         f.write(f"\n{'-' * 40}\n")
-        f.write(wind_summary.replace("*", ""))  # Strip Markdown asterisks for plain text
+        f.write(wind_summary.replace("*", ""))
     print(f"📄 Transcript saved: {filename}")
 
 
@@ -173,7 +142,6 @@ def run_atis_monitor():
     timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%SZ")
 
     # 1. Record 60s of KDVT ATIS
-    #    User-Agent spoofing prevents LiveATC 403 blocks from cloud/home IPs
     print("📻 Recording KDVT ATIS...")
     result = subprocess.run([
         'ffmpeg', '-y',
@@ -188,12 +156,12 @@ def run_atis_monitor():
 
     if result.returncode != 0:
         print("❌ ffmpeg failed:")
-        print(result.stderr[-2000:])  # Last 2000 chars to avoid wall of text
+        print(result.stderr[-2000:])
         raise subprocess.CalledProcessError(result.returncode, 'ffmpeg')
 
     print("✅ Recording complete.")
 
-    # 2. Transcribe and analyze with Gemini
+    # 2. Transcribe with Gemini
     print("🧠 Analyzing with Gemini...")
     client      = genai.Client(api_key=API_KEY)
     file_upload = client.files.upload(file=AUDIO_FILE)
@@ -219,7 +187,7 @@ def run_atis_monitor():
         """
 
         response  = client.models.generate_content(
-            model='gemini-2.0-flash-lite',
+            model='gemini-2.5-flash-preview-04-17',
             contents=[prompt, file_upload]
         )
         full_text = response.text
@@ -230,7 +198,7 @@ def run_atis_monitor():
         if match:
             current_letter = match.group(1).strip()
 
-        # 4. Parse active runways — structured field first, then full-text fallback
+        # 4. Parse active runways
         runways_in_use = []
         rwy_line = re.search(r'^RUNWAYS IN USE:\s*(.+)', full_text, re.IGNORECASE | re.MULTILINE)
         if rwy_line:
@@ -241,14 +209,14 @@ def run_atis_monitor():
         print(f"📋 ATIS Letter    : {current_letter}")
         print(f"🛬  Runways in use : {', '.join(runways_in_use) if runways_in_use else 'Not detected'}")
 
-        # 5. Calculate wind components for active runways
+        # 5. Wind components
         wind_summary = wind_components_summary(full_text, runways_in_use)
         print(wind_summary.replace("*", ""))
 
-        # 6. Always save the transcript regardless of whether letter changed
+        # 6. Save transcript
         save_transcript(timestamp, current_letter, full_text, runways_in_use, wind_summary)
 
-        # 7. Compare with last known letter — only notify on a real change
+        # 7. Only notify if letter changed
         last_letter = get_last_letter()
 
         if current_letter == "Unknown":
@@ -269,14 +237,12 @@ def run_atis_monitor():
             print("📨 Telegram message sent and state updated.")
 
     finally:
-        # Clean up Gemini-hosted file
         try:
             client.files.delete(name=file_upload.name)
             print("🗑️  Cleaned up Gemini file.")
         except Exception as e:
             print(f"⚠️  Could not delete Gemini file: {e}")
 
-        # Always delete the local temp audio file
         if os.path.exists(AUDIO_FILE):
             os.remove(AUDIO_FILE)
             print("🗑️  Deleted temp audio file.")
