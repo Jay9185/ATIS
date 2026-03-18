@@ -2,9 +2,9 @@ name: Proactive ATIS Monitor
 
 on:
   schedule:
-    - cron: '05,35 13-23,0-6 * * *'
+    # Runs at 5 mins past the hour, from 6:05 AM to 11:05 PM MST (13:00 to 06:00 UTC)
+    - cron: '5 13-23,0-6 * * *'
   workflow_dispatch:
-
 concurrency:
   group: atis-monitor
   cancel-in-progress: false
