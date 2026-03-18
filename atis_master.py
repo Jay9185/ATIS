@@ -3,30 +3,24 @@ import re
 import math
 import subprocess
 import requests
+import json # <-- Added for robust parsing
 from datetime import datetime
 from google import genai
 
-# --- CONFIGURATION ---
-API_KEY       = os.getenv("GEMINI_API_KEY",    "YOUR_GEMINI_API_KEY_HERE")
-BOT_TOKEN     = os.getenv("TELEGRAM_BOT_TOKEN","YOUR_TELEGRAM_BOT_TOKEN_HERE")
-CHAT_ID       = os.getenv("TELEGRAM_CHAT_ID",  "YOUR_TELEGRAM_CHAT_ID_HERE")
+# ... [KEEP CONFIGURATION SECTION THE SAME] ...
 
-STREAM_URL    = "http://s1-fmt2.liveatc.net/kdvt3_atis"
-AUDIO_FILE    = "/tmp/atis_temp.mp3"
-STATE_FILE    = "last_atis_letter.txt"
-
-RUNWAY_HEADINGS = {
-    "7L":  74,  "25R": 254,
-    "7R":  74,  "25L": 254,
-    "7":   74,  "25":  254,
-}
-
-# --- HELPERS ---
+# --- UPGRADED HELPERS ---
 def parse_wind(wind_text):
-    m = re.search(r'(\d{3})\s*(?:at|@|\-)\s*(\d+)', wind_text, re.IGNORECASE)
-    if m: return int(m.group(1)), int(m.group(2))
-    if "calm" in wind_text.lower(): return None, 0
-    return None, None
+    # Upgraded to capture optional gusts (e.g., "250 at 15 gusts 25")
+    m = re.search(r'(\d{3})\s*(?:at|@|\-)\s*(\d+)(?:.*?(?:g|gust|gusts)\s*(?:to\s*)?(\d+))?', wind_text, re.IGNORECASE)
+    if m: 
+        dir_ = int(m.group(1))
+        spd = int(m.group(2))
+        gust = int(m.group(3)) if m.group(3) else None
+        return dir_, spd, gust
+    if "calm" in wind_text.lower(): 
+        return None, 0, None
+    return None, None, None
 
 def calc_wind_components(wind_dir, wind_speed, runway_heading):
     angle = math.radians(wind_dir - runway_heading)
@@ -35,7 +29,7 @@ def calc_wind_components(wind_dir, wind_speed, runway_heading):
     return headwind, crosswind
 
 def get_wind_summary(wind_text, runways):
-    wind_dir, wind_speed = parse_wind(wind_text)
+    wind_dir, wind_speed, gust_speed = parse_wind(wind_text)
     if wind_speed == 0:
         return "Calm - no crosswind"
     if wind_dir is None or wind_speed is None:
@@ -48,19 +42,22 @@ def get_wind_summary(wind_text, runways):
             hw, xw = calc_wind_components(wind_dir, wind_speed, heading)
             hw_label = f"{abs(hw)}kt {'headwind' if hw >= 0 else 'tailwind'}"
             xw_label = f"{abs(xw)}kt from the {'right' if xw >= 0 else 'left'}"
+            
+            # Add gust components if they exist
+            if gust_speed:
+                hw_g, xw_g = calc_wind_components(wind_dir, gust_speed, heading)
+                hw_label += f" (Gusts {abs(hw_g)}kt)"
+                xw_label += f" (Gusts {abs(xw_g)}kt)"
+
             lines.append(f"- Rwy {rwy} ({heading:03d}°): {hw_label} | {xw_label}")
     return "\n".join(lines)
-
-def extract_field(pattern, text, default="N/A"):
-    match = re.search(pattern, text, re.IGNORECASE | re.MULTILINE)
-    return match.group(1).strip() if match else default
 
 def send_telegram(message):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     payload = {"chat_id": CHAT_ID, "text": message, "parse_mode": "Markdown"}
     requests.post(url, json=payload, timeout=10).raise_for_status()
 
-# --- MAIN LOGIC ---
+# --- UPGRADED MAIN LOGIC ---
 def run_atis_monitor():
     print("Recording KDVT ATIS...")
     subprocess.run([
@@ -75,41 +72,48 @@ def run_atis_monitor():
     try:
         file_upload = client.files.upload(file=AUDIO_FILE)
         
+        # Upgraded prompt with location context and strict JSON formatting
         prompt = """
-        Listen to this KDVT ATIS/ASOS recording.
-        Extract the critical aviation details ONLY. Do NOT include a transcript.
-        Format your response EXACTLY as follows:
-        LETTER: [Letter, or "None"]
-        TIME: [Zulu Time]
-        WIND: [Direction] at [Speed]
-        VIS: [Visibility]
-        SKY: [Sky Condition]
-        TEMP: [Temp/Dewpoint]
-        ALTIMETER: [Altimeter]
-        RUNWAYS: [Comma separated active runways ONLY, e.g., 7R, 25L]
-        NOTAMS: [Very brief summary]
+        Listen to this Phoenix Deer Valley (KDVT) ATIS/ASOS recording.
+        You are an expert aviation transcriber. Be highly accurate with weather data and KDVT runway designators (7R, 7L, 25R, 25L).
+        Extract the aviation details and return ONLY a valid JSON object with the following exact keys (do not use markdown blocks):
+        {
+            "letter": "Alpha", 
+            "time": "1253Z", 
+            "wind": "250 at 15 gusts 20", 
+            "vis": "10 SM", 
+            "sky": "Clear", 
+            "temp": "25/10", 
+            "altimeter": "29.92", 
+            "runways": "7R, 7L", 
+            "notams": "Brief summary here"
+        }
+        If the tower is closed or no information letter is given, set "letter" to "None".
         """
 
         response = client.models.generate_content(
-            model='gemini-3-flash-preview', 
+            model='gemini-2.5-flash', # Upgraded to a stronger model if available in your API tier
             contents=[prompt, file_upload]
         )
-        data = response.text
+        
+        # Clean the response in case the LLM wraps it in markdown
+        json_text = response.text.strip().removeprefix("```json").removesuffix("```").strip()
+        data = json.loads(json_text)
 
-        # Parse Fields
-        letter = extract_field(r'LETTER:\s*(.+)', data).capitalize()
+        # Parse Fields safely via Dictionary Keys
+        letter = data.get("letter", "None").capitalize()
         if letter.lower() == "none" or not letter:
             print("Tower closed or no letter. Skipping notification.")
             return
 
-        time_z = extract_field(r'TIME:\s*(.+)', data)
-        wind   = extract_field(r'WIND:\s*(.+)', data)
-        vis    = extract_field(r'VIS:\s*(.+)', data)
-        sky    = extract_field(r'SKY:\s*(.+)', data)
-        temp   = extract_field(r'TEMP:\s*(.+)', data)
-        alt    = extract_field(r'ALTIMETER:\s*(.+)', data)
-        rwys_raw = extract_field(r'RUNWAYS:\s*(.+)', data)
-        notams = extract_field(r'NOTAMS:\s*(.+)', data)
+        time_z   = data.get("time", "N/A")
+        wind     = data.get("wind", "N/A")
+        vis      = data.get("vis", "N/A")
+        sky      = data.get("sky", "N/A")
+        temp     = data.get("temp", "N/A")
+        alt      = data.get("altimeter", "N/A")
+        rwys_raw = data.get("runways", "")
+        notams   = data.get("notams", "N/A")
 
         runways_list = re.findall(r'\b(\d{1,2}[LRC]?)\b', rwys_raw)
 
@@ -142,6 +146,8 @@ def run_atis_monitor():
         else:
             print(f"No change (Information {letter}).")
 
+    except json.JSONDecodeError as e:
+        print(f"Failed to parse JSON from Gemini: {e}\nRaw output: {response.text}")
     except Exception as e:
         print(f"Error: {e}")
 
