@@ -3,13 +3,26 @@ import re
 import math
 import subprocess
 import requests
-import json # <-- Added for robust parsing
+import json
 from datetime import datetime
 from google import genai
 
-# ... [KEEP CONFIGURATION SECTION THE SAME] ...
+# --- CONFIGURATION ---
+API_KEY       = os.getenv("GEMINI_API_KEY",    "YOUR_GEMINI_API_KEY_HERE")
+BOT_TOKEN     = os.getenv("TELEGRAM_BOT_TOKEN","YOUR_TELEGRAM_BOT_TOKEN_HERE")
+CHAT_ID       = os.getenv("TELEGRAM_CHAT_ID",  "YOUR_TELEGRAM_CHAT_ID_HERE")
 
-# --- UPGRADED HELPERS ---
+STREAM_URL    = "http://s1-fmt2.liveatc.net/kdvt3_atis"
+AUDIO_FILE    = "/tmp/atis_temp.mp3"
+STATE_FILE    = "last_atis_letter.txt"
+
+RUNWAY_HEADINGS = {
+    "7L":  74,  "25R": 254,
+    "7R":  74,  "25L": 254,
+    "7":   74,  "25":  254,
+}
+
+# --- HELPERS ---
 def parse_wind(wind_text):
     # Upgraded to capture optional gusts (e.g., "250 at 15 gusts 25")
     m = re.search(r'(\d{3})\s*(?:at|@|\-)\s*(\d+)(?:.*?(?:g|gust|gusts)\s*(?:to\s*)?(\d+))?', wind_text, re.IGNORECASE)
@@ -57,7 +70,7 @@ def send_telegram(message):
     payload = {"chat_id": CHAT_ID, "text": message, "parse_mode": "Markdown"}
     requests.post(url, json=payload, timeout=10).raise_for_status()
 
-# --- UPGRADED MAIN LOGIC ---
+# --- MAIN LOGIC ---
 def run_atis_monitor():
     print("Recording KDVT ATIS...")
     subprocess.run([
@@ -92,7 +105,7 @@ def run_atis_monitor():
         """
 
         response = client.models.generate_content(
-            model='gemini-2.5-flash', # Upgraded to a stronger model if available in your API tier
+            model='gemini-2.5-flash', 
             contents=[prompt, file_upload]
         )
         
