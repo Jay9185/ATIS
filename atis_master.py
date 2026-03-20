@@ -10,7 +10,8 @@ from google import genai
 # --- CONFIGURATION ---
 API_KEY       = os.getenv("GEMINI_API_KEY",    "YOUR_GEMINI_API_KEY_HERE")
 BOT_TOKEN     = os.getenv("TELEGRAM_BOT_TOKEN","YOUR_TELEGRAM_BOT_TOKEN_HERE")
-CHAT_ID       = os.getenv("TELEGRAM_CHAT_ID",  "YOUR_TELEGRAM_CHAT_ID_HERE")
+CHAT_IDS_RAW  = os.getenv("TELEGRAM_CHAT_IDS", "YOUR_ID_1, YOUR_ID_2")
+CHAT_IDS      = [cid.strip() for cid in CHAT_IDS_RAW.split(",") if cid.strip()]
 
 STREAM_URL    = "http://s1-fmt2.liveatc.net/kdvt3_atis"
 AUDIO_FILE    = "/tmp/atis_temp.mp3"
@@ -67,8 +68,15 @@ def get_wind_summary(wind_text, runways):
 
 def send_telegram(message):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": CHAT_ID, "text": message, "parse_mode": "Markdown"}
-    requests.post(url, json=payload, timeout=10).raise_for_status()
+    
+    # NEW: Loop through every ID in the list
+    for chat_id in CHAT_IDS:
+        payload = {"chat_id": chat_id, "text": message, "parse_mode": "Markdown"}
+        try:
+            requests.post(url, json=payload, timeout=10).raise_for_status()
+            print(f"Sent to Telegram ID: {chat_id}")
+        except Exception as e:
+            print(f"Failed to send to {chat_id}: {e}")
 
 # --- MAIN LOGIC ---
 def run_atis_monitor():
