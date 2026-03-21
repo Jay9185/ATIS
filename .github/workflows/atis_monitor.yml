@@ -2,8 +2,10 @@ name: Proactive ATIS Monitor
 
 on:
   schedule:
-    # Runs at 5 mins past the hour, from 6:05 AM to 11:05 PM MST (13:00 to 06:00 UTC)
-    - cron: '5 13-23,0-6 * * *'
+    # Runs at 2 and 32 mins past the hour (dodging the :00 and :30 GitHub traffic)
+    # Covers 6:02 AM to 11:32 PM MST 
+    - cron: '2,32 13-23,0-6 * * *'
+  
   workflow_dispatch:
 concurrency:
   group: atis-monitor
