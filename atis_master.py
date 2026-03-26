@@ -8,14 +8,16 @@ from datetime import datetime
 from google import genai
 
 # --- CONFIGURATION ---
-API_KEY       = os.getenv("GEMINI_API_KEY",    "YOUR_GEMINI_API_KEY_HERE")
-BOT_TOKEN     = os.getenv("TELEGRAM_BOT_TOKEN","YOUR_TELEGRAM_BOT_TOKEN_HERE")
-CHAT_IDS_RAW  = os.getenv("TELEGRAM_CHAT_IDS", "YOUR_ID_1, YOUR_ID_2")
-CHAT_IDS      = [cid.strip() for cid in CHAT_IDS_RAW.split(",") if cid.strip()]
+API_KEY           = os.getenv("GEMINI_API_KEY",    "YOUR_GEMINI_API_KEY_HERE")
+BOT_TOKEN         = os.getenv("TELEGRAM_BOT_TOKEN","YOUR_TELEGRAM_BOT_TOKEN_HERE")
+TRMNL_WEBHOOK_URL = os.getenv("TRMNL_WEBHOOK_URL", "")
 
-STREAM_URL    = "http://s1-fmt2.liveatc.net/kdvt3_atis"
-AUDIO_FILE    = "/tmp/atis_temp.mp3"
-STATE_FILE    = "last_atis_letter.txt"
+CHAT_IDS_RAW      = os.getenv("TELEGRAM_CHAT_IDS", "YOUR_ID_1")
+CHAT_IDS          = [cid.strip() for cid in CHAT_IDS_RAW.split(",") if cid.strip()]
+
+STREAM_URL        = "http://s1-fmt2.liveatc.net/kdvt3_atis"
+AUDIO_FILE        = "/tmp/atis_temp.mp3"
+STATE_FILE        = "last_atis_letter.txt"
 
 RUNWAY_HEADINGS = {
     "7L":  74,  "25R": 254,
@@ -25,15 +27,22 @@ RUNWAY_HEADINGS = {
 
 # --- HELPERS ---
 def parse_wind(wind_text):
-    # Upgraded to capture optional gusts (e.g., "250 at 15 gusts 25")
+    if "calm" in wind_text.lower(): 
+        return None, 0, None
+        
+    m_var = re.search(r'(?:variable|vrb)\s*(?:at|@|\-)?\s*(\d+)(?:.*?(?:g|gust|gusts)\s*(?:to\s*)?(\d+))?', wind_text, re.IGNORECASE)
+    if m_var:
+        spd = int(m_var.group(1))
+        gust = int(m_var.group(2)) if m_var.group(2) else None
+        return "VRB", spd, gust
+
     m = re.search(r'(\d{3})\s*(?:at|@|\-)\s*(\d+)(?:.*?(?:g|gust|gusts)\s*(?:to\s*)?(\d+))?', wind_text, re.IGNORECASE)
     if m: 
         dir_ = int(m.group(1))
         spd = int(m.group(2))
         gust = int(m.group(3)) if m.group(3) else None
         return dir_, spd, gust
-    if "calm" in wind_text.lower(): 
-        return None, 0, None
+
     return None, None, None
 
 def calc_wind_components(wind_dir, wind_speed, runway_heading):
@@ -44,8 +53,14 @@ def calc_wind_components(wind_dir, wind_speed, runway_heading):
 
 def get_wind_summary(wind_text, runways):
     wind_dir, wind_speed, gust_speed = parse_wind(wind_text)
+    
     if wind_speed == 0:
         return "Calm - no crosswind"
+        
+    if wind_dir == "VRB":
+        gust_text = f" (Gusts {gust_speed}kt)" if gust_speed else ""
+        return f"Variable winds at {wind_speed}kt{gust_text}. Component calculation N/A."
+        
     if wind_dir is None or wind_speed is None:
         return "Wind parsing failed"
 
@@ -57,7 +72,6 @@ def get_wind_summary(wind_text, runways):
             hw_label = f"{abs(hw)}kt {'headwind' if hw >= 0 else 'tailwind'}"
             xw_label = f"{abs(xw)}kt from the {'right' if xw >= 0 else 'left'}"
             
-            # Add gust components if they exist
             if gust_speed:
                 hw_g, xw_g = calc_wind_components(wind_dir, gust_speed, heading)
                 hw_label += f" (Gusts {abs(hw_g)}kt)"
@@ -68,8 +82,6 @@ def get_wind_summary(wind_text, runways):
 
 def send_telegram(message):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    
-    # NEW: Loop through every ID in the list
     for chat_id in CHAT_IDS:
         payload = {"chat_id": chat_id, "text": message, "parse_mode": "Markdown"}
         try:
@@ -77,6 +89,31 @@ def send_telegram(message):
             print(f"Sent to Telegram ID: {chat_id}")
         except Exception as e:
             print(f"Failed to send to {chat_id}: {e}")
+
+def send_trmnl_webhook(letter, time_z, wind, vis, sky, temp, alt, rwys_raw, wind_summary, notams):
+    if not TRMNL_WEBHOOK_URL:
+        return
+
+    payload = {
+        "merge_variables": {
+            "letter": letter,
+            "time": time_z,
+            "wind": wind,
+            "vis": vis,
+            "sky": sky,
+            "temp": temp,
+            "alt": alt,
+            "runways": rwys_raw,
+            "wind_summary": wind_summary,
+            "notams": notams
+        }
+    }
+    try:
+        response = requests.post(TRMNL_WEBHOOK_URL, json=payload, timeout=10)
+        response.raise_for_status()
+        print("Pushed update to TRMNL device.")
+    except Exception as e:
+        print(f"Failed to update TRMNL: {e}")
 
 # --- MAIN LOGIC ---
 def run_atis_monitor():
@@ -93,7 +130,6 @@ def run_atis_monitor():
     try:
         file_upload = client.files.upload(file=AUDIO_FILE)
         
-        # Upgraded prompt with location context and strict JSON formatting
         prompt = """
         Listen to this Phoenix Deer Valley (KDVT) ATIS/ASOS recording.
         You are an expert aviation transcriber. Be highly accurate with weather data and KDVT runway designators (7R, 7L, 25R, 25L).
@@ -117,11 +153,9 @@ def run_atis_monitor():
             contents=[prompt, file_upload]
         )
         
-        # Clean the response in case the LLM wraps it in markdown
         json_text = response.text.strip().removeprefix("```json").removesuffix("```").strip()
         data = json.loads(json_text)
 
-        # Parse Fields safely via Dictionary Keys
         letter = data.get("letter", "None").capitalize()
         if letter.lower() == "none" or not letter:
             print("Tower closed or no letter. Skipping notification.")
@@ -138,7 +172,6 @@ def run_atis_monitor():
 
         runways_list = re.findall(r'\b(\d{1,2}[LRC]?)\b', rwys_raw)
 
-        # State check
         last_letter = ""
         if os.path.exists(STATE_FILE):
             with open(STATE_FILE, "r") as f: last_letter = f.read().strip()
@@ -146,7 +179,6 @@ def run_atis_monitor():
         if letter != last_letter:
             wind_summary = get_wind_summary(wind, runways_list)
             
-            # Markdown Layout
             msg = (
                 f"*KDVT ATIS — Info {letter}*\n"
                 f"`------------------------`\n"
@@ -162,6 +194,8 @@ def run_atis_monitor():
             )
             
             send_telegram(msg)
+            send_trmnl_webhook(letter, time_z, wind, vis, sky, temp, alt, rwys_raw, wind_summary, notams)
+            
             with open(STATE_FILE, "w") as f: f.write(letter)
             print(f"Sent Information {letter}")
         else:
