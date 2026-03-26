@@ -5,8 +5,8 @@ on:
     # Runs at 2 and 32 mins past the hour (dodging the :00 and :30 GitHub traffic)
     # Covers 6:02 AM to 11:32 PM MST 
     - cron: '2,32 13-23,0-6 * * *'
-  
   workflow_dispatch:
+
 concurrency:
   group: atis-monitor
   cancel-in-progress: false
@@ -34,9 +34,10 @@ jobs:
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          # NEW: Updated secret name
           TELEGRAM_CHAT_IDS: ${{ secrets.TELEGRAM_CHAT_IDS }}
+          TRMNL_WEBHOOK_URL: ${{ secrets.TRMNL_WEBHOOK_URL }}
         run: python atis_master.py
+
       - name: Commit State
         run: |
           git config --local user.email "action@github.com"
