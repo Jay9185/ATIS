@@ -80,13 +80,35 @@ def get_wind_summary(wind_text, runways):
             lines.append(f"- Rwy {rwy} ({heading:03d}°): {hw_label} | {xw_label}")
     return "\n".join(lines)
 
+def escape_markdown(text):
+    """Escape characters that break Telegram's legacy Markdown parser.
+    Prevents malformed-entity 400 errors when LLM-generated text (NOTAMs,
+    wind remarks, etc.) contains stray _, *, `, or [ characters."""
+    if text is None:
+        return ""
+    text = str(text)
+    for ch in ("_", "*", "`", "["):
+        text = text.replace(ch, f"\\{ch}")
+    return text
+
 def send_telegram(message):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     for chat_id in CHAT_IDS:
         payload = {"chat_id": chat_id, "text": message, "parse_mode": "Markdown"}
         try:
-            requests.post(url, json=payload, timeout=10).raise_for_status()
+            resp = requests.post(url, json=payload, timeout=10)
+            resp.raise_for_status()
             print(f"Sent to Telegram ID: {chat_id}")
+        except requests.exceptions.HTTPError:
+            # Markdown parsing can still fail on edge-case input; fall back to plain text
+            # so the notification isn't silently dropped.
+            print(f"Markdown send failed for {chat_id} ({resp.status_code}: {resp.text}); retrying as plain text")
+            try:
+                plain_payload = {"chat_id": chat_id, "text": message}
+                requests.post(url, json=plain_payload, timeout=10).raise_for_status()
+                print(f"Sent (plain text fallback) to Telegram ID: {chat_id}")
+            except Exception as e2:
+                print(f"Failed to send to {chat_id} even as plain text: {e2}")
         except Exception as e:
             print(f"Failed to send to {chat_id}: {e}")
 
@@ -118,16 +140,25 @@ def send_trmnl_webhook(letter, time_z, wind, vis, sky, temp, alt, rwys_raw, wind
 # --- MAIN LOGIC ---
 def run_atis_monitor():
     print("Recording KDVT ATIS...")
-    subprocess.run([
-        'ffmpeg', '-y', '-user_agent', 'Mozilla/5.0',
-        '-i', STREAM_URL, '-t', '120', '-ar', '16000', '-ac', '1',
-        '-af', 'highpass=f=200,lowpass=f=3000', AUDIO_FILE
-    ], capture_output=True, check=True)
+    try:
+        subprocess.run([
+            'ffmpeg', '-y', '-user_agent', 'Mozilla/5.0',
+            '-i', STREAM_URL, '-t', '120', '-ar', '16000', '-ac', '1',
+            '-af', 'highpass=f=200,lowpass=f=3000', AUDIO_FILE
+        ], capture_output=True, check=True)
+    except subprocess.CalledProcessError as e:
+        stderr = e.stderr.decode(errors="replace") if e.stderr else ""
+        print(f"ffmpeg recording failed: {e}\n{stderr}")
+        return
+    except FileNotFoundError:
+        print("ffmpeg is not installed or not on PATH.")
+        return
 
-    client = genai.Client(api_key=API_KEY)
+    client = None
     file_upload = None
 
     try:
+        client = genai.Client(api_key=API_KEY)
         file_upload = client.files.upload(file=AUDIO_FILE)
         
         prompt = """
@@ -153,22 +184,30 @@ def run_atis_monitor():
             contents=[prompt, file_upload]
         )
         
-        json_text = response.text.strip().removeprefix("```json").removesuffix("```").strip()
+        # Strip any markdown code fence Gemini might wrap the JSON in, whether
+        # or not it's tagged "```json" (dict.get(key, default) below still
+        # wouldn't protect us if the model emits JSON `null` for a key it *does*
+        # include, since that's a present key with value None, not a missing key).
+        json_text = re.sub(r'^```(?:json)?\s*|\s*```$', '', response.text.strip())
         data = json.loads(json_text)
 
-        letter = data.get("letter", "None").capitalize()
+        # Use `or` (not just .get(key, default)) so an explicit JSON null for a
+        # present key also falls back to the default, instead of propagating
+        # None into code that assumes a string (e.g. letter.capitalize(),
+        # wind_text.lower(), re.findall on runways).
+        letter = (data.get("letter") or "None").capitalize()
         if letter.lower() == "none" or not letter:
             print("Tower closed or no letter. Skipping notification.")
             return
 
-        time_z   = data.get("time", "N/A")
-        wind     = data.get("wind", "N/A")
-        vis      = data.get("vis", "N/A")
-        sky      = data.get("sky", "N/A")
-        temp     = data.get("temp", "N/A")
-        alt      = data.get("altimeter", "N/A")
-        rwys_raw = data.get("runways", "")
-        notams   = data.get("notams", "N/A")
+        time_z   = data.get("time") or "N/A"
+        wind     = data.get("wind") or "N/A"
+        vis      = data.get("vis") or "N/A"
+        sky      = data.get("sky") or "N/A"
+        temp     = data.get("temp") or "N/A"
+        alt      = data.get("altimeter") or "N/A"
+        rwys_raw = data.get("runways") or ""
+        notams   = data.get("notams") or "N/A"
 
         runways_list = re.findall(r'\b(\d{1,2}[LRC]?)\b', rwys_raw)
 
@@ -182,15 +221,15 @@ def run_atis_monitor():
             msg = (
                 f"*KDVT ATIS — Info {letter}*\n"
                 f"`------------------------`\n"
-                f"*Time:* {time_z}\n"
-                f"*Wind:* {wind}\n"
-                f"*Vis:* {vis}\n"
-                f"*Sky:* {sky}\n"
-                f"*Temp:* {temp}\n"
-                f"*Alt:* {alt}\n"
-                f"*Runways:* {rwys_raw}\n\n"
+                f"*Time:* {escape_markdown(time_z)}\n"
+                f"*Wind:* {escape_markdown(wind)}\n"
+                f"*Vis:* {escape_markdown(vis)}\n"
+                f"*Sky:* {escape_markdown(sky)}\n"
+                f"*Temp:* {escape_markdown(temp)}\n"
+                f"*Alt:* {escape_markdown(alt)}\n"
+                f"*Runways:* {escape_markdown(rwys_raw)}\n\n"
                 f"*Wind Components:*\n{wind_summary}\n\n"
-                f"*NOTAMs:*\n_{notams}_"
+                f"*NOTAMs:*\n_{escape_markdown(notams)}_"
             )
             
             send_telegram(msg)
@@ -207,9 +246,9 @@ def run_atis_monitor():
         print(f"Error: {e}")
 
     finally:
-        if file_upload:
+        if client and file_upload:
             try: client.files.delete(name=file_upload.name)
-            except: pass
+            except Exception as e: print(f"Failed to delete uploaded file: {e}")
         if os.path.exists(AUDIO_FILE): os.remove(AUDIO_FILE)
 
 if __name__ == "__main__":
