@@ -1,11 +1,19 @@
 import os
 import re
 import math
+import time
 import subprocess
 import requests
 import json
-from datetime import datetime
+import logging
+from datetime import datetime, timezone
 from google import genai
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+logger = logging.getLogger("atis_master")
 
 # --- CONFIGURATION ---
 API_KEY           = os.getenv("GEMINI_API_KEY",    "YOUR_GEMINI_API_KEY_HERE")
@@ -98,19 +106,19 @@ def send_telegram(message):
         try:
             resp = requests.post(url, json=payload, timeout=10)
             resp.raise_for_status()
-            print(f"Sent to Telegram ID: {chat_id}")
+            logger.info(f"Sent to Telegram ID: {chat_id}")
         except requests.exceptions.HTTPError:
             # Markdown parsing can still fail on edge-case input; fall back to plain text
             # so the notification isn't silently dropped.
-            print(f"Markdown send failed for {chat_id} ({resp.status_code}: {resp.text}); retrying as plain text")
+            logger.warning(f"Markdown send failed for {chat_id} ({resp.status_code}: {resp.text}); retrying as plain text")
             try:
                 plain_payload = {"chat_id": chat_id, "text": message}
                 requests.post(url, json=plain_payload, timeout=10).raise_for_status()
-                print(f"Sent (plain text fallback) to Telegram ID: {chat_id}")
+                logger.info(f"Sent (plain text fallback) to Telegram ID: {chat_id}")
             except Exception as e2:
-                print(f"Failed to send to {chat_id} even as plain text: {e2}")
+                logger.error(f"Failed to send to {chat_id} even as plain text: {e2}")
         except Exception as e:
-            print(f"Failed to send to {chat_id}: {e}")
+            logger.error(f"Failed to send to {chat_id}: {e}")
 
 def send_trmnl_webhook(letter, time_z, wind, vis, sky, temp, alt, rwys_raw, wind_summary, notams):
     if not TRMNL_WEBHOOK_URL:
@@ -133,13 +141,54 @@ def send_trmnl_webhook(letter, time_z, wind, vis, sky, temp, alt, rwys_raw, wind
     try:
         response = requests.post(TRMNL_WEBHOOK_URL, json=payload, timeout=10)
         response.raise_for_status()
-        print("Pushed update to TRMNL device.")
+        logger.info("Pushed update to TRMNL device.")
     except Exception as e:
-        print(f"Failed to update TRMNL: {e}")
+        logger.error(f"Failed to update TRMNL: {e}")
+
+def call_with_retries(fn, attempts=3, base_delay=5, what="operation"):
+    """Call fn() with retries on transient failure (exponential backoff).
+    Re-raises the last exception if every attempt fails."""
+    last_exc = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return fn()
+        except Exception as e:
+            last_exc = e
+            if attempt < attempts:
+                delay = base_delay * (2 ** (attempt - 1))
+                logger.warning(f"{what} failed (attempt {attempt}/{attempts}): {e}. Retrying in {delay}s...")
+                time.sleep(delay)
+            else:
+                logger.error(f"{what} failed after {attempts} attempts: {e}")
+    raise last_exc
+
+def check_atis_time_freshness(time_z, max_age_minutes=90):
+    """Sanity-check that the transcribed Zulu time (e.g. '1253Z') is recent,
+    to help flag a garbled/hallucinated transcription rather than silently
+    sending a stale-looking ATIS update. Returns a warning string or None."""
+    m = re.match(r'^(\d{2})(\d{2})Z?$', str(time_z).strip(), re.IGNORECASE)
+    if not m:
+        return None  # can't parse; not fatal, just skip the check
+
+    hour, minute = int(m.group(1)), int(m.group(2))
+    if hour > 23 or minute > 59:
+        return f"Transcribed time '{time_z}' is not a valid HHMM time"
+
+    from datetime import timedelta
+    now = datetime.now(timezone.utc)
+    candidate = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    # ATIS time could be just before/after UTC midnight relative to "now";
+    # check yesterday/today/tomorrow variants and take the closest.
+    diffs = [abs((now - (candidate + timedelta(days=d))).total_seconds()) / 60 for d in (-1, 0, 1)]
+    age_minutes = min(diffs)
+
+    if age_minutes > max_age_minutes:
+        return f"Transcribed time '{time_z}' is {age_minutes:.0f} min from current UTC ({now.strftime('%H%MZ')}); possible transcription error"
+    return None
 
 # --- MAIN LOGIC ---
 def run_atis_monitor():
-    print("Recording KDVT ATIS...")
+    logger.info("Recording KDVT ATIS...")
     try:
         subprocess.run([
             'ffmpeg', '-y', '-user_agent', 'Mozilla/5.0',
@@ -148,19 +197,31 @@ def run_atis_monitor():
         ], capture_output=True, check=True)
     except subprocess.CalledProcessError as e:
         stderr = e.stderr.decode(errors="replace") if e.stderr else ""
-        print(f"ffmpeg recording failed: {e}\n{stderr}")
+        logger.error(f"ffmpeg recording failed: {e}\n{stderr}")
         return
     except FileNotFoundError:
-        print("ffmpeg is not installed or not on PATH.")
+        logger.error("ffmpeg is not installed or not on PATH.")
         return
 
     client = None
     file_upload = None
+    response = None
 
     try:
         client = genai.Client(api_key=API_KEY)
         file_upload = client.files.upload(file=AUDIO_FILE)
-        
+
+        # Some google-genai SDK versions process the upload asynchronously;
+        # poll until it's ACTIVE (or FAILED) before referencing it in generate_content.
+        wait_start = time.time()
+        while getattr(file_upload, "state", None) is not None and str(file_upload.state) not in ("ACTIVE", "State.ACTIVE"):
+            if str(getattr(file_upload, "state", "")) in ("FAILED", "State.FAILED"):
+                raise RuntimeError(f"Gemini file upload failed to process: {file_upload}")
+            if time.time() - wait_start > 60:
+                raise TimeoutError("Timed out waiting for Gemini file upload to become ACTIVE")
+            time.sleep(2)
+            file_upload = client.files.get(name=file_upload.name)
+
         prompt = """
         Listen to this Phoenix Deer Valley (KDVT) ATIS/ASOS recording.
         You are an expert aviation transcriber. Be highly accurate with weather data and KDVT runway designators (7R, 7L, 25R, 25L).
@@ -179,11 +240,14 @@ def run_atis_monitor():
         If the tower is closed or no information letter is given, set "letter" to "None".
         """
 
-        response = client.models.generate_content(
-            model='gemini-2.5-flash', 
-            contents=[prompt, file_upload]
+        response = call_with_retries(
+            lambda: client.models.generate_content(
+                model='gemini-2.5-flash',
+                contents=[prompt, file_upload]
+            ),
+            attempts=3, base_delay=5, what="Gemini generate_content call"
         )
-        
+
         # Strip any markdown code fence Gemini might wrap the JSON in, whether
         # or not it's tagged "```json" (dict.get(key, default) below still
         # wouldn't protect us if the model emits JSON `null` for a key it *does*
@@ -191,13 +255,17 @@ def run_atis_monitor():
         json_text = re.sub(r'^```(?:json)?\s*|\s*```$', '', response.text.strip())
         data = json.loads(json_text)
 
+        if not isinstance(data, dict):
+            logger.error(f"Gemini returned JSON that wasn't an object (got {type(data).__name__}): {json_text[:300]}")
+            return
+
         # Use `or` (not just .get(key, default)) so an explicit JSON null for a
         # present key also falls back to the default, instead of propagating
         # None into code that assumes a string (e.g. letter.capitalize(),
         # wind_text.lower(), re.findall on runways).
         letter = (data.get("letter") or "None").capitalize()
         if letter.lower() == "none" or not letter:
-            print("Tower closed or no letter. Skipping notification.")
+            logger.info("Tower closed or no letter. Skipping notification.")
             return
 
         time_z   = data.get("time") or "N/A"
@@ -208,6 +276,10 @@ def run_atis_monitor():
         alt      = data.get("altimeter") or "N/A"
         rwys_raw = data.get("runways") or ""
         notams   = data.get("notams") or "N/A"
+
+        freshness_warning = check_atis_time_freshness(time_z)
+        if freshness_warning:
+            logger.warning(freshness_warning)
 
         runways_list = re.findall(r'\b(\d{1,2}[LRC]?)\b', rwys_raw)
 
@@ -236,19 +308,20 @@ def run_atis_monitor():
             send_trmnl_webhook(letter, time_z, wind, vis, sky, temp, alt, rwys_raw, wind_summary, notams)
             
             with open(STATE_FILE, "w") as f: f.write(letter)
-            print(f"Sent Information {letter}")
+            logger.info(f"Sent Information {letter}")
         else:
-            print(f"No change (Information {letter}).")
+            logger.info(f"No change (Information {letter}).")
 
     except json.JSONDecodeError as e:
-        print(f"Failed to parse JSON from Gemini: {e}\nRaw output: {response.text}")
+        raw = response.text if response is not None else "<no response>"
+        logger.error(f"Failed to parse JSON from Gemini: {e}\nRaw output: {raw}")
     except Exception as e:
-        print(f"Error: {e}")
+        logger.exception(f"Error: {e}")
 
     finally:
         if client and file_upload:
             try: client.files.delete(name=file_upload.name)
-            except Exception as e: print(f"Failed to delete uploaded file: {e}")
+            except Exception as e: logger.warning(f"Failed to delete uploaded file: {e}")
         if os.path.exists(AUDIO_FILE): os.remove(AUDIO_FILE)
 
 if __name__ == "__main__":
