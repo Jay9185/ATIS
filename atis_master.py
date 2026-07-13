@@ -8,6 +8,7 @@ import json
 import logging
 from datetime import datetime, timezone
 from google import genai
+from google.genai import types as genai_types
 
 logging.basicConfig(
     level=logging.INFO,
@@ -213,9 +214,13 @@ def run_atis_monitor():
 
         # Some google-genai SDK versions process the upload asynchronously;
         # poll until it's ACTIVE (or FAILED) before referencing it in generate_content.
+        # NOTE: compare against the FileState enum itself, not a hardcoded string --
+        # str(file_upload.state) renders as "FileState.ACTIVE" / "FileState.FAILED"
+        # in current SDK versions, which never matched the old "ACTIVE"/"State.ACTIVE"
+        # checks, so every run silently spun for 60s and timed out.
         wait_start = time.time()
-        while getattr(file_upload, "state", None) is not None and str(file_upload.state) not in ("ACTIVE", "State.ACTIVE"):
-            if str(getattr(file_upload, "state", "")) in ("FAILED", "State.FAILED"):
+        while file_upload.state not in (None, genai_types.FileState.ACTIVE):
+            if file_upload.state == genai_types.FileState.FAILED:
                 raise RuntimeError(f"Gemini file upload failed to process: {file_upload}")
             if time.time() - wait_start > 60:
                 raise TimeoutError("Timed out waiting for Gemini file upload to become ACTIVE")
